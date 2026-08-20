@@ -6,22 +6,27 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
                Rater &rater, GpuSimulator &gpu_sim,
                MatrixMemoryAllocator matrix_memory_allocator) {
   assert(keys.size() == values.size());
+  const size_t d = 512;
+  
+  // Move all keys and values to SRAM at the beginning
+  for (size_t j = 0; j < keys.size(); ++j) {
+    gpu_sim.MoveMatrixToSharedMem(keys[j]);
+    gpu_sim.MoveMatrixToSharedMem(values[j]);
+  }
+
   Matrix *K = nullptr;
   Matrix *V = nullptr;
-  const size_t d = 512;
 
   for (size_t round = 0; round < keys.size(); ++round) {
     auto current_query = rater.GetNextQuery();
     const size_t num_keys = round + 1;
 
-    // Issue IO instructions early to maximize parallelism
+    // Issue IO for current query early
     gpu_sim.MoveMatrixToSharedMem(current_query);
-    gpu_sim.MoveMatrixToSharedMem(keys[round]);
-    gpu_sim.MoveMatrixToSharedMem(values[round]);
 
-    // Build K matrix incrementally
+    // Build K incrementally
     if (K == nullptr) {
-      K = matrix_memory_allocator.Allocate("K_0");
+      K = matrix_memory_allocator.Allocate("K");
       gpu_sim.Copy(keys[0], K, kInSharedMemory);
     } else {
       Matrix *new_K = matrix_memory_allocator.Allocate("K_" + std::to_string(round));
@@ -30,9 +35,9 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
       K = new_K;
     }
 
-    // Build V matrix incrementally
+    // Build V incrementally
     if (V == nullptr) {
-      V = matrix_memory_allocator.Allocate("V_0");
+      V = matrix_memory_allocator.Allocate("V");
       gpu_sim.Copy(values[0], V, kInSharedMemory);
     } else {
       Matrix *new_V = matrix_memory_allocator.Allocate("V_" + std::to_string(round));
@@ -41,59 +46,62 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
       V = new_V;
     }
 
-    // Compute K^T
-    Matrix *K_transpose = matrix_memory_allocator.Allocate("K_transpose_" + std::to_string(round));
-    gpu_sim.Copy(K, K_transpose, kInSharedMemory);
-    gpu_sim.Transpose(K_transpose, kInSharedMemory);
+    // Compute K^T once per round
+    Matrix *Kt = matrix_memory_allocator.Allocate("Kt_" + std::to_string(round));
+    gpu_sim.Copy(K, Kt, kInSharedMemory);
+    gpu_sim.Transpose(Kt, kInSharedMemory);
 
-    // Compute Q * K^T
-    Matrix *QKt = matrix_memory_allocator.Allocate("QKt_" + std::to_string(round));
-    gpu_sim.MatMul(current_query, K_transpose, QKt);
-
-    // Process each row to compute softmax
     std::vector<Matrix *> attention_rows;
-    for (size_t row = 0; row < num_keys; ++row) {
-      Matrix *row_mat = matrix_memory_allocator.Allocate("row_" + std::to_string(round) + "_" + std::to_string(row));
-      gpu_sim.GetRow(QKt, row, row_mat, kInSharedMemory);
 
-      Matrix *exp_row = matrix_memory_allocator.Allocate("exp_row_" + std::to_string(round) + "_" + std::to_string(row));
-      gpu_sim.MatExp(row_mat, exp_row);
-      gpu_sim.ReleaseMatrix(row_mat);
+    // Process each query row
+    for (size_t q_row = 0; q_row < num_keys; ++q_row) {
+      // Get query row
+      Matrix *q = matrix_memory_allocator.Allocate("q_" + std::to_string(round) + "_" + std::to_string(q_row));
+      gpu_sim.GetRow(current_query, q_row, q, kInSharedMemory);
 
-      Matrix *sum_exp = matrix_memory_allocator.Allocate("sum_exp_" + std::to_string(round) + "_" + std::to_string(row));
-      gpu_sim.Sum(exp_row, sum_exp);
+      // Compute q * K^T
+      Matrix *qKt = matrix_memory_allocator.Allocate("qKt_" + std::to_string(round) + "_" + std::to_string(q_row));
+      gpu_sim.MatMul(q, Kt, qKt);
+      gpu_sim.ReleaseMatrix(q);
 
-      Matrix *softmax_row = matrix_memory_allocator.Allocate("softmax_row_" + std::to_string(round) + "_" + std::to_string(row));
-      gpu_sim.MatDiv(exp_row, sum_exp, softmax_row);
-      gpu_sim.ReleaseMatrix(exp_row);
+      // Compute softmax
+      Matrix *exp = matrix_memory_allocator.Allocate("exp_" + std::to_string(round) + "_" + std::to_string(q_row));
+      gpu_sim.MatExp(qKt, exp);
+      gpu_sim.ReleaseMatrix(qKt);
+
+      Matrix *sum_exp = matrix_memory_allocator.Allocate("sum_exp_" + std::to_string(round) + "_" + std::to_string(q_row));
+      gpu_sim.Sum(exp, sum_exp);
+
+      Matrix *softmax = matrix_memory_allocator.Allocate("softmax_" + std::to_string(round) + "_" + std::to_string(q_row));
+      gpu_sim.MatDiv(exp, sum_exp, softmax);
+      gpu_sim.ReleaseMatrix(exp);
       gpu_sim.ReleaseMatrix(sum_exp);
 
-      // Compute attention row = softmax_row * V
-      Matrix *attn_row = matrix_memory_allocator.Allocate("attn_row_" + std::to_string(round) + "_" + std::to_string(row));
-      gpu_sim.MatMul(softmax_row, V, attn_row);
-      gpu_sim.ReleaseMatrix(softmax_row);
+      // Compute attention row
+      Matrix *attn_row = matrix_memory_allocator.Allocate("attn_row_" + std::to_string(round) + "_" + std::to_string(q_row));
+      gpu_sim.MatMul(softmax, V, attn_row);
+      gpu_sim.ReleaseMatrix(softmax);
 
       attention_rows.push_back(attn_row);
     }
 
-    // Release intermediate matrices early
-    gpu_sim.ReleaseMatrix(K_transpose);
-    gpu_sim.ReleaseMatrix(QKt);
+    // Release Kt early
+    gpu_sim.ReleaseMatrix(Kt);
 
-    // Concatenate attention rows to form final attention matrix
+    // Concatenate attention rows
     Matrix *attention = attention_rows[0];
     for (size_t j = 1; j < num_keys; ++j) {
-      Matrix *new_attention = matrix_memory_allocator.Allocate("attention_" + std::to_string(round));
-      gpu_sim.Concat(attention, attention_rows[j], new_attention, 0, kInSharedMemory);
+      Matrix *new_attn = matrix_memory_allocator.Allocate("attention_" + std::to_string(round));
+      gpu_sim.Concat(attention, attention_rows[j], new_attn, 0, kInSharedMemory);
       gpu_sim.ReleaseMatrix(attention);
       gpu_sim.ReleaseMatrix(attention_rows[j]);
-      attention = new_attention;
+      attention = new_attn;
     }
 
-    // Move attention to HBM as early as possible to overlap IO with calculations
+    // Move to HBM early to overlap IO with any remaining calculations
     gpu_sim.MoveMatrixToGpuHbm(attention);
 
-    // Run the simulator to execute all queued instructions
+    // Run the simulator
     gpu_sim.Run(false, &matrix_memory_allocator);
 
     // Commit the answer
